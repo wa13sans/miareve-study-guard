@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -6,173 +6,229 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 [assembly: AssemblyTitle("Miareve Study Guard")]
-[assembly: AssemblyDescription("디자인 · After Effects 공부 알림 / Beta 1.0.0")]
+[assembly: AssemblyDescription("Design study reminders with optional local vision AI / Beta 1.1")]
 [assembly: AssemblyCompany("Miareve")]
 [assembly: AssemblyProduct("Miareve Study Guard")]
 [assembly: AssemblyCopyright("Copyright © 2026 Miareve")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyInformationalVersion("1.0.0-beta")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0-beta")]
 namespace Miareve {
-    internal static class Program {
-        [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
-        [STAThread] static int Main(string[] args) {
-            SetProcessDPIAware(); Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
-            try {
-                using (MainForm f = new MainForm()) {
-                    if (args.Length == 2 && args[0] == "--render-preview") {
-                        f.Show(); Application.DoEvents();
-                        using (Bitmap b = new Bitmap(f.Width, f.Height)) { f.DrawToBitmap(b, new Rectangle(0,0,f.Width,f.Height)); b.Save(args[1]); }
-                        f.Close(); return 0;
-                    }
-                    Application.Run(f);
-                }
-                return 0;
-            } catch (Exception ex) {
-                MessageBox.Show("앱을 시작하지 못했습니다.\n" + ex.Message, "Miareve Study Guard", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1;
-            }
-        }
+ internal static class Program {
+  [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+  [STAThread] static int Main(string[] args) {
+   SetProcessDPIAware(); Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+   try {
+    if(args.Length==2 && args[0]=="--preview") { Preview.Run(args[1]); return 0; }
+    using(var single=new Mutex(false,"Local\\MiareveStudyGuard")) {
+     bool acquired; try { acquired=single.WaitOne(0); } catch(AbandonedMutexException) { acquired=true; }
+     if(!acquired) { MessageBox.Show("이미 실행 중입니다. Ctrl+Alt+H로 열어 주세요. / Already running: press Ctrl+Alt+H."); return 0; }
+     try { Application.Run(new MainForm(new Storage(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Miareve","StudyGuard")))); }
+     finally { single.ReleaseMutex(); }
     }
-    internal static class Native {
-        [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll", CharSet=CharSet.Unicode)] internal static extern int GetWindowText(IntPtr h, StringBuilder b, int length);
-        [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-        [StructLayout(LayoutKind.Sequential)] internal struct LastInput { public uint size; public uint time; }
-        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput info);
-        internal static double Idle() { LastInput l = new LastInput(); l.size = (uint)Marshal.SizeOf(l); if (!GetLastInputInfo(ref l)) throw new InvalidOperationException("입력 상태를 읽지 못했습니다."); return unchecked((uint)Environment.TickCount-l.time)/1000.0; }
+    return 0;
+   } catch(Exception ex) { MessageBox.Show(ex.Message,"Miareve Study Guard",MessageBoxButtons.OK,MessageBoxIcon.Error); return 1; }
+  }
+ }
+ internal static class Native {
+  [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] internal static extern int GetWindowText(IntPtr h,StringBuilder b,int length);
+  [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+  [DllImport("user32.dll")] internal static extern bool RegisterHotKey(IntPtr h,int id,uint mod,uint key);
+  [DllImport("user32.dll")] internal static extern bool UnregisterHotKey(IntPtr h,int id);
+  [StructLayout(LayoutKind.Sequential)] internal struct LastInput { public uint size; public uint time; }
+  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput info);
+  internal static double Idle() { var l=new LastInput(); l.size=(uint)Marshal.SizeOf(l); if(!GetLastInputInfo(ref l)) throw new IOException("Input unavailable"); return unchecked((uint)Environment.TickCount-l.time)/1000.0; }
+ }
+ public sealed class MainForm : Form {
+  readonly Storage storage; Settings settings; readonly DecisionCache cache;
+  readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer(); readonly Stopwatch watch=Stopwatch.StartNew(); readonly FocusClock clock=new FocusClock();
+  Label status,reason,stats,privacy,hotkeys; CheckBox consent; Button start; NotifyIcon tray; Reminder reminder;
+  object plugin; Type pluginType; bool running,locked,editing,busy,disposing; int generation,messageIndex;
+  double lastTick,nextSample,nextAi,breakUntil,decisionAt,lastRequest; string context="",lastTitle="",previousImage; Decision decision=Decision.Unknown("");
+  CancellationTokenSource aiJob; readonly int ownPid=Process.GetCurrentProcess().Id;
+  public MainForm(Storage store) {
+   storage=store; settings=store.Load(); cache=new DecisionCache(store.Root);
+   Text="Miareve Study Guard · Beta 1.1"; ClientSize=new Size(800,720); MinimumSize=new Size(816,720); StartPosition=FormStartPosition.CenterScreen;
+   BackColor=Theme.Background; ForeColor=Color.White; Font=new Font("맑은 고딕",10); AutoScaleMode=AutoScaleMode.Dpi;
+   using(var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream("ScreenAccessPlugin.dll")) {
+    if(stream==null) throw new IOException("Screen plugin missing");
+    using(var ms=new MemoryStream()) { stream.CopyTo(ms); pluginType=Assembly.Load(ms.ToArray()).GetType("Miareve.Plugins.ScreenAccessPlugin",true); plugin=Activator.CreateInstance(pluginType); }
+   }
+   tray=new NotifyIcon { Icon=SystemIcons.Information,Visible=true,Text="Miareve Study Guard" }; tray.DoubleClick+=delegate { ShowMain(); };
+   Build(); timer.Interval=1000; timer.Tick+=delegate { Tick(); }; timer.Start();
+   SystemEvents.SessionSwitch+=SessionSwitch; SystemEvents.PowerModeChanged+=PowerChanged;
+   if(storage.Warning!=null) reason.Text=storage.Warning;
+  }
+  string T(string ko,string en) { return settings.T(ko,en); }
+  void Build() {
+   bool permission=consent!=null && consent.Checked;
+   while(Controls.Count>0) Controls[0].Dispose();
+   var root=Theme.Table(); Controls.Add(root);
+   var brand=Theme.Label("M I A R E V E   /   S T U D Y  G U A R D",10); brand.ForeColor=Theme.Accent; Theme.Row(root,brand,35);
+   Theme.Row(root,Theme.Label(T("오늘의 한 장면을 완성하자.","Make your next scene."),25),67);
+   var card=Theme.Table(); card.BackColor=Theme.Card; card.Padding=new Padding(14);
+   status=Theme.Label(T("시작할 준비가 됐어요","Ready when you are"),17); status.ForeColor=Theme.Accent;
+   reason=Theme.Label(T("화면 허용 후 공부 시작을 누르세요.","Allow screen access, then start studying.")); stats=Theme.Label("");
+   Theme.Row(card,status,44); Theme.Row(card,reason,76); Theme.Row(card,stats,34); Theme.Row(root,card,185);
+   consent=new CheckBox { Text=T("화면 보기 허용 · 이번 실행 중에만","Allow screen access · this session only"),Checked=permission,AutoSize=true };
+   consent.CheckedChanged+=delegate { if(!consent.Checked) Stop(); UpdateState(); }; Theme.Row(root,consent,40);
+   privacy=Theme.Label(""); privacy.ForeColor=Theme.Muted; Theme.Row(root,privacy,68);
+   start=Theme.Button(T("공부 시작","Start"),delegate { Toggle(); }); start.BackColor=Theme.Accent; start.ForeColor=Theme.Background;
+   Theme.Row(root,Theme.Flow(start,Theme.Button(T("10분 쉬기","Rest 10 minutes"),delegate { Rest(); }),Theme.Button(T("알림 테스트","Test reminder"),delegate { ShowReminder(); }),Theme.Button(T("설정","Settings"),delegate { OpenSettings(); })),55);
+   Theme.Row(root,Theme.Flow(Theme.Button(T("숨기기","Hide"),delegate { Hide(); }),Theme.Button(T("완전 종료","Exit completely"),delegate { Close(); })),50);
+   hotkeys=Theme.Label(T("Ctrl+Alt+H 숨기기/표시 · Ctrl+Alt+Q 종료","Ctrl+Alt+H hide/show · Ctrl+Alt+Q exit"),9); hotkeys.ForeColor=Theme.Muted; Theme.Row(root,hotkeys,28);
+   Theme.Row(root,Theme.Label(T("제작자 Miareve · 베타 1.1 · 무료 사용 / 유료 재배포 금지","Created by Miareve · Beta 1.1 · Free use / no paid redistribution"),9),30);
+   if(tray.ContextMenuStrip!=null) tray.ContextMenuStrip.Dispose();
+   var menu=new ContextMenuStrip(); menu.Items.Add(T("열기","Open"),null,delegate { ShowMain(); }); menu.Items.Add(T("설정","Settings"),null,delegate { ShowMain(); OpenSettings(); });
+   menu.Items.Add(T("10분 쉬기","Rest 10 minutes"),null,delegate { Rest(); }); menu.Items.Add(T("화면 허용 해제","Revoke screen access"),null,delegate { consent.Checked=false; }); menu.Items.Add(T("완전 종료","Exit completely"),null,delegate { Close(); }); tray.ContextMenuStrip=menu;
+   UpdateState();
+  }
+  protected override void OnHandleCreated(EventArgs e) {
+   base.OnHandleCreated(e); bool a=Native.RegisterHotKey(Handle,1,0x4003,(uint)Keys.H),b=Native.RegisterHotKey(Handle,2,0x4003,(uint)Keys.Q);
+   if((!a || !b) && hotkeys!=null) hotkeys.Text=T("단축키 충돌: 버튼 또는 트레이 메뉴를 이용하세요.","Hotkey conflict: use buttons or the tray menu.");
+  }
+  protected override void OnHandleDestroyed(EventArgs e) { Native.UnregisterHotKey(Handle,1); Native.UnregisterHotKey(Handle,2); base.OnHandleDestroyed(e); }
+  protected override void WndProc(ref Message m) { if(m.Msg==0x312) { if(m.WParam.ToInt32()==1) { if(Visible) Hide(); else ShowMain(); } if(m.WParam.ToInt32()==2) Close(); } base.WndProc(ref m); }
+  void ShowMain() { Show(); WindowState=FormWindowState.Normal; Activate(); }
+  void EnablePlugin(bool enable) { pluginType.GetMethod("SetEnabled").Invoke(plugin,new object[]{enable}); }
+  void ResetInference() {
+   generation++; if(aiJob!=null) aiJob.Cancel(); previousImage=null; context=""; lastTitle=""; nextAi=0; decision=Decision.Unknown(""); decisionAt=0;
+  }
+  void Suspend() { ResetInference(); clock.ResetAway(); EnablePlugin(false); CloseReminder(); }
+  void Stop() { running=false; breakUntil=0; Suspend(); status.Text=T("일시 정지 · 화면 접근 중지","Paused · screen access stopped"); reason.Text=T("공부 시작을 누르면 다시 확인합니다.","Press Start to resume."); UpdateState(); }
+  void Toggle() {
+   if(running) { Stop(); return; } if(!consent.Checked) return;
+   running=true; breakUntil=0; ResetInference(); lastTick=watch.Elapsed.TotalSeconds; nextSample=0; EnablePlugin(true);
+   status.Text=T("공부 상태 확인 중","Checking study activity"); reason.Text=T("공부할 앱이나 강의로 이동하세요.","Switch to your creative app or lesson."); UpdateState();
+  }
+  void Rest() { if(!running) { CloseReminder(); return; } breakUntil=watch.Elapsed.TotalSeconds+600; Suspend(); status.Text=T("10분 휴식 · 화면 접근 중지","10 minute break · screen access stopped"); UpdateState(); }
+  void CloseReminder() { if(reminder!=null && !reminder.IsDisposed) reminder.Close(); reminder=null; }
+  void ShowReminder() {
+   if(reminder!=null && !reminder.IsDisposed) return;
+   reminder=new Reminder(settings.Language,messageIndex++,delegate { clock.ResetAway(); },delegate { Rest(); }); reminder.Show();
+   if(settings.Sound) System.Media.SystemSounds.Exclamation.Play();
+  }
+  void ClearCache() { ResetInference(); clock.ResetAway(); EnablePlugin(false); cache.Clear(); reason.Text=T("캐시 삭제 완료 · 새로 판단합니다.","Cache cleared · next check starts fresh."); }
+  void OpenSettings() {
+   if(editing) return; editing=true; Suspend();
+   try {
+    using(var f=new SettingsForm(settings,cache,ClearCache,storage.Root)) if(f.ShowDialog(this)==DialogResult.OK) {
+     try { storage.Save(f.Result); settings=f.Result; ResetInference(); if(!settings.CacheEnabled) cache.Clear(); Build(); }
+     catch(Exception ex) { MessageBox.Show(this,ex.Message,T("저장 실패","Save failed")); }
     }
-    public sealed class MainForm : Form {
-        readonly Color bg = Color.FromArgb(17,20,30), panel = Color.FromArgb(28,33,47), muted = Color.FromArgb(158,170,195), accent = Color.FromArgb(183,165,255);
-        readonly Timer timer = new Timer(); readonly Stopwatch watch = Stopwatch.StartNew();
-        readonly FocusClock clock = new FocusClock();
-        Label status, reason, stats, privacy; CheckBox consent; NumericUpDown minutes; TextBox keywords; Button start;
-        NotifyIcon tray; Reminder reminder; object plugin; Type pluginType;
-        bool running, locked; double lastTick, breakUntil; string loadError;
-        public MainForm() {
-            Text = "Miareve Study Guard · 베타 1.0.0Ver"; ClientSize = new Size(820, 780); MinimumSize = new Size(836, 819);
-            StartPosition = FormStartPosition.CenterScreen; BackColor = bg; ForeColor = Color.White; Font = new Font("맑은 고딕", 10);
-            AutoScaleMode = AutoScaleMode.Dpi;
-            var root = new TableLayoutPanel { Dock=DockStyle.Fill, AutoScroll=true, Padding=new Padding(28), ColumnCount=1, RowCount=0 };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100)); Controls.Add(root);
-            Add(root, L("M I A R E V E   /   S T U D Y  G U A R D",10,accent),32);
-            Add(root, L("오늘의 한 장면을 완성하자.",25,Color.White),62);
-            Add(root, L("디자인 · After Effects · Illustrator · Blender · Unity",10,muted),32);
-            var card = new Panel { Dock=DockStyle.Fill, BackColor=panel, Padding=new Padding(18) };
-            status = L("시작할 준비가 됐어요",17,accent); status.Location=new Point(18,14); status.Size=new Size(620,38);
-            reason = L("화면 접근을 허용한 뒤 공부 시작을 눌러 주세요.",10,Color.White); reason.Location=new Point(18,58); reason.Size=new Size(620,42);
-            stats = L("이번 세션  00:00:00  ·  공부 이탈  00:00",10,muted); stats.Location=new Point(18,103); stats.Size=new Size(620,28);
-            card.Controls.AddRange(new Control[]{status,reason,stats}); Add(root,card,151);
-            Add(root,L("화면 접근 플러그인",12,Color.White),40);
-            consent = new CheckBox { Text="화면 보기 허용 (현재 실행 중에만)", AutoSize=true, ForeColor=Color.White, Dock=DockStyle.Fill };
-            consent.CheckedChanged += delegate { OnConsent(); }; Add(root,consent,34);
-            privacy = L("5초마다 활성 창이 있는 모니터를 메모리에서 분석합니다.\n화면 이미지·창 제목 저장 없음 / 외부 전송 없음 / 언제든 허용 해제",9,muted); Add(root,privacy,52);
-            var settings = new FlowLayoutPanel { Dock=DockStyle.Fill, WrapContents=false };
-            settings.Controls.Add(L("공부 이탈 알림까지",10,Color.White));
-            minutes = new NumericUpDown { Minimum=1, Maximum=60, Value=5, Width=65, BackColor=panel, ForeColor=Color.White };
-            settings.Controls.Add(minutes); settings.Controls.Add(L("분  (다시 알림도 같은 간격)",10,muted)); Add(root,settings,43);
-            Add(root,L("강의·자료 창 제목에 포함되면 공부로 볼 단어 (쉼표로 구분)",10,Color.White),32);
-            keywords = new TextBox { Text=StudyPolicy.DefaultKeywords, Multiline=true, ScrollBars=ScrollBars.Vertical, Dock=DockStyle.Fill, BackColor=panel, ForeColor=Color.White, BorderStyle=BorderStyle.FixedSingle };
-            Add(root,keywords,61);
-            var buttons = new FlowLayoutPanel { Dock=DockStyle.Fill, Padding=new Padding(0,12,0,0), WrapContents=false };
-            start = B("공부 시작",accent); start.Enabled=false; start.Click += delegate { Toggle(); };
-            var pause=B("10분 쉬기",panel); pause.Click += delegate { TakeBreak(); };
-            var test=B("알림 테스트",panel); test.Click += delegate { ShowReminder(); };
-            var hide=B("트레이로",panel); hide.Click += delegate { Hide(); tray.ShowBalloonTip(2000,"Miareve Study Guard","트레이 아이콘을 두 번 클릭하면 돌아옵니다.",ToolTipIcon.Info); };
-            buttons.Controls.AddRange(new Control[]{start,pause,test,hide}); Add(root,buttons,66);
-            Add(root,L("규칙 기반 추정이므로 오판할 수 있어요. AI가 학습 내용을 이해하는 방식은 아닙니다.\n제작자 Miareve   ·   베타 1.0.0Ver   ·   닫기(X)는 앱 완전 종료",9,muted),55);
-            tray = new NotifyIcon { Icon=SystemIcons.Information, Text="Miareve Study Guard · 대기", Visible=true };
-            var menu = new ContextMenuStrip(); menu.Items.Add("앱 열기",null,delegate { Show(); WindowState=FormWindowState.Normal; Activate(); });
-            menu.Items.Add("10분 쉬기",null,delegate { TakeBreak(); }); menu.Items.Add("화면 허용 해제",null,delegate { consent.Checked=false; }); menu.Items.Add("종료",null,delegate { Close(); }); tray.ContextMenuStrip=menu;
-            tray.DoubleClick += delegate { Show(); WindowState=FormWindowState.Normal; Activate(); };
-            try {
-                using (Stream s=Assembly.GetExecutingAssembly().GetManifestResourceStream("ScreenAccessPlugin.dll")) {
-                    byte[] bytes=new byte[s.Length]; int offset=0, read; while ((read=s.Read(bytes,offset,bytes.Length-offset))>0) offset+=read;
-                    pluginType=Assembly.Load(bytes).GetType("Miareve.Plugins.ScreenAccessPlugin",true); plugin=Activator.CreateInstance(pluginType);
-                }
-            } catch (Exception ex) { loadError=ex.GetBaseException().Message; consent.Enabled=false; reason.Text="화면 플러그인을 불러오지 못했습니다: " + loadError; }
-            timer.Interval=5000; timer.Tick += delegate { Tick(); }; timer.Start();
-            SystemEvents.SessionSwitch += SessionSwitch; SystemEvents.PowerModeChanged += PowerChanged;
-        }
-        Label L(string text,int size,Color color) { return new Label { Text=text, Font=new Font("맑은 고딕",size), ForeColor=color, AutoSize=true, Margin=new Padding(0,4,8,0) }; }
-        Button B(string text,Color color) { return new Button { Text=text, BackColor=color, ForeColor=color==accent?bg:Color.White, FlatStyle=FlatStyle.Flat, Size=new Size(140,38), Margin=new Padding(0,0,10,0), Cursor=Cursors.Hand }; }
-        void Add(TableLayoutPanel root,Control c,int height) { int row=root.RowCount++; root.RowStyles.Add(new RowStyle(SizeType.Absolute,height)); c.Dock=DockStyle.Fill; root.Controls.Add(c,0,row); }
-        void EnablePlugin(bool enabled) { if (plugin!=null) pluginType.GetMethod("SetEnabled").Invoke(plugin,new object[]{enabled}); }
-        void OnConsent() {
-            if (!consent.Checked) { Stop(); privacy.Text="화면 접근 꺼짐 · 메모리 분석 데이터 삭제됨\n다시 허용하기 전에는 화면과 창 정보를 읽지 않습니다."; }
-            else privacy.Text="화면 접근 허용됨 · 공부 시작을 누르면 분석합니다.\n화면 이미지·창 제목 저장 없음 / 외부 전송 없음";
-            start.Enabled=consent.Checked && plugin!=null;
-        }
-        void Stop() { running=false; breakUntil=0; EnablePlugin(false); clock.ResetAway(); start.Text="공부 시작"; status.Text="일시 정지 · 화면 접근 중지"; reason.Text="공부 시작을 누르면 새로 판단합니다."; tray.Text="Miareve Study Guard · 정지"; CloseReminder(); }
-        void Toggle() {
-            if (running) { Stop(); return; } if (!consent.Checked || plugin==null) return;
-            running=true; breakUntil=0; clock.ResetAway(); lastTick=watch.Elapsed.TotalSeconds; EnablePlugin(true); start.Text="일시 정지";
-            status.Text="공부 상태 확인 중"; reason.Text="공부할 앱이나 강의 창으로 이동해 주세요."; tray.Text="Miareve Study Guard · 화면 분석 중";
-        }
-        void TakeBreak() { if (!running) return; breakUntil=watch.Elapsed.TotalSeconds+600; EnablePlugin(false); clock.ResetAway(); CloseReminder(); status.Text="10분 휴식 · 화면 접근 중지"; reason.Text="휴식이 끝나면 자동으로 다시 확인합니다."; tray.Text="Miareve Study Guard · 휴식"; }
-        void CloseReminder() { if (reminder!=null && !reminder.IsDisposed) reminder.Close(); reminder=null; }
-        void ShowReminder() {
-            if (reminder!=null && !reminder.IsDisposed) return;
-            reminder=new Reminder(delegate { clock.ResetAway(); }, delegate { TakeBreak(); }); reminder.Show();
-            System.Media.SystemSounds.Exclamation.Play();
-        }
-        void SessionSwitch(object sender,SessionSwitchEventArgs e) {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke((Action)delegate { locked=e.Reason!=SessionSwitchReason.SessionUnlock && e.Reason!=SessionSwitchReason.SessionLogon; EnablePlugin(false); clock.ResetAway(); lastTick=watch.Elapsed.TotalSeconds; CloseReminder(); });
-        }
-        void PowerChanged(object sender,PowerModeChangedEventArgs e) {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke((Action)delegate { EnablePlugin(false); clock.ResetAway(); lastTick=watch.Elapsed.TotalSeconds; CloseReminder(); });
-        }
-        void Tick() {
-            double now=watch.Elapsed.TotalSeconds, elapsed=now-lastTick; lastTick=now;
-            if (!running || !consent.Checked) return;
-            if (locked) { status.Text="화면 잠금 · 분석 중지"; return; }
-            if (now<breakUntil) { status.Text="휴식 중 · " + TimeSpan.FromSeconds(breakUntil-now).ToString(@"mm\:ss"); return; }
-            if (breakUntil>0) { breakUntil=0; clock.ResetAway(); elapsed=0; }
-            // Skip system suspend gaps, rather than crediting unseen time.
-            if (elapsed>20) { clock.ResetAway(); elapsed=0; EnablePlugin(false); }
-            try {
-                IntPtr h=Native.GetForegroundWindow(); uint pid; Native.GetWindowThreadProcessId(h,out pid);
-                if (h==IntPtr.Zero || pid==0) throw new InvalidOperationException("활성 창을 확인할 수 없습니다.");
-                string name; using (Process p=Process.GetProcessById((int)pid)) name=p.ProcessName;
-                if (pid==(uint)Process.GetCurrentProcess().Id) { clock.ResetAway(); status.Text="설정 중 · 공부 앱으로 이동해 주세요"; reason.Text="앱 설정 중에는 공부 시간을 기록하지 않습니다."; return; }
-                StringBuilder title=new StringBuilder(1024); Native.GetWindowText(h,title,title.Capacity);
-                // Enabling is idempotent only when the plugin was paused; preserve sample history otherwise.
-                if (!(bool)pluginType.GetProperty("Enabled").GetValue(plugin,null)) EnablePlugin(true);
-                double change=(double)pluginType.GetMethod("Sample").Invoke(plugin,null);
-                bool studying=StudyPolicy.IsStudying(name,title.ToString(),keywords.Text,Native.Idle(),change>0.006);
-                clock.Tick(studying,elapsed);
-                status.Text=studying?"좋아요, 공부 흐름을 이어가요.":"잠깐, 공부에서 벗어났나요?";
-                reason.Text=studying?"공부 관련 앱·창과 활동이 확인됐어요. (추정)":"관련 앱·창 또는 활동을 찾지 못했어요. 설정한 시간이 지나면 알려드릴게요.";
-                stats.Text="이번 세션  "+TimeSpan.FromSeconds(clock.StudySeconds).ToString(@"hh\:mm\:ss")+"  ·  공부 이탈  "+TimeSpan.FromSeconds(clock.AwaySeconds).ToString(@"mm\:ss");
-                tray.Text="Miareve Study Guard · "+(studying?"공부 중 (추정)":"공부 이탈 (추정)");
-                if (studying) CloseReminder();
-                if (clock.AwaySeconds >= (double)minutes.Value*60) { clock.ResetAway(); ShowReminder(); }
-            } catch {
-                Stop(); status.Text="분석이 중지됐어요"; reason.Text="화면 또는 앱 정보를 읽지 못했습니다. 화면 잠금을 해제하고 공부 시작을 눌러 주세요.";
-            }
-        }
-        protected override void Dispose(bool disposing) {
-            if (disposing) { timer.Stop(); timer.Dispose(); SystemEvents.SessionSwitch-=SessionSwitch; SystemEvents.PowerModeChanged-=PowerChanged; EnablePlugin(false); CloseReminder(); if (tray!=null) { tray.Visible=false; tray.Dispose(); } }
-            base.Dispose(disposing);
-        }
+   } finally { editing=false; lastTick=watch.Elapsed.TotalSeconds; nextSample=0; if(running && consent.Checked && !locked && watch.Elapsed.TotalSeconds>=breakUntil) EnablePlugin(true); UpdateState(); }
+  }
+  void SessionSwitch(object sender,SessionSwitchEventArgs e) {
+   if(disposing || !IsHandleCreated) return;
+   BeginInvoke((Action)delegate {
+    if(e.Reason==SessionSwitchReason.SessionLock || e.Reason==SessionSwitchReason.SessionLogoff || e.Reason==SessionSwitchReason.RemoteDisconnect || e.Reason==SessionSwitchReason.ConsoleDisconnect) { locked=true; Suspend(); }
+    else if(e.Reason==SessionSwitchReason.SessionUnlock || e.Reason==SessionSwitchReason.SessionLogon || e.Reason==SessionSwitchReason.RemoteConnect || e.Reason==SessionSwitchReason.ConsoleConnect) { locked=false; ResetInference(); nextSample=0; }
+    lastTick=watch.Elapsed.TotalSeconds;
+   });
+  }
+  void PowerChanged(object sender,PowerModeChangedEventArgs e) { if(disposing || !IsHandleCreated) return; BeginInvoke((Action)delegate { Suspend(); lastTick=watch.Elapsed.TotalSeconds; nextSample=0; }); }
+  void UpdateState() {
+   if(start==null) return; start.Enabled=consent.Checked; start.Text=running?T("일시 정지","Pause"):T("공부 시작","Start");
+   string mode=settings.Provider=="Ollama"?T("무료 로컬 AI","Free local AI"):settings.Provider=="Off"?T("단어 규칙","Word rules"):settings.Provider;
+   privacy.Text=mode+" · "+settings.Model+"\n"+T("활성 창만 분석 · 화면 저장 안 함 · 알림까지 ","Active window only · no image files · reminder after ")+settings.AlertSeconds+T("초"," sec");
+   if(settings.Provider=="OpenAI") privacy.Text+=" · "+settings.Endpoint;
+   stats.Text=T("공부 ","Study ")+TimeSpan.FromSeconds(clock.StudySeconds).ToString(@"hh\:mm\:ss")+T("  / 이탈 ","  / Away ")+TimeSpan.FromSeconds(clock.AwaySeconds).ToString(@"hh\:mm\:ss")+"  / "+settings.AlertSeconds+T("초","s");
+   tray.Text="Miareve Study Guard · "+(running?T("실행 중","Running"):T("정지","Paused"));
+  }
+  void Tick() {
+   double now=watch.Elapsed.TotalSeconds,elapsed=now-lastTick; lastTick=now;
+   if(!running || !consent.Checked || editing) return;
+   if(locked) { status.Text=T("화면 잠금 · 분석 중지","Screen locked · analysis paused"); return; }
+   if(now<breakUntil) { status.Text=T("휴식 중 · ","Break · ")+TimeSpan.FromSeconds(breakUntil-now).ToString(@"mm\:ss"); return; }
+   if(breakUntil>0) { breakUntil=0; Suspend(); nextSample=0; elapsed=0; }
+   if(elapsed>10) { Suspend(); nextSample=0; elapsed=0; }
+   try {
+    IntPtr h=Native.GetForegroundWindow(); uint pid; Native.GetWindowThreadProcessId(h,out pid);
+    if(h==IntPtr.Zero || pid==0) throw new IOException("Foreground window unavailable");
+    if(pid==(uint)ownPid) { clock.ResetAway(); UpdateState(); return; }
+    var title=new StringBuilder(1024); Native.GetWindowText(h,title,title.Capacity); string currentTitle=title.ToString();
+    string nextContext=h.ToString()+"|"+currentTitle;
+    if(nextContext!=context) { ResetInference(); context=nextContext; lastTitle=currentTitle; nextSample=0; }
+    string process; using(var p=Process.GetProcessById((int)pid)) process=p.ProcessName;
+    bool browser=process.Equals("chrome",StringComparison.OrdinalIgnoreCase) || process.Equals("msedge",StringComparison.OrdinalIgnoreCase) || process.Equals("firefox",StringComparison.OrdinalIgnoreCase) || process.Equals("brave",StringComparison.OrdinalIgnoreCase) || currentTitle.IndexOf("YouTube",StringComparison.OrdinalIgnoreCase)>=0;
+    if(now>=nextSample) {
+     nextSample=now+2;
+     if(!(bool)pluginType.GetProperty("Enabled").GetValue(plugin,null)) EnablePlugin(true);
+     byte[] jpeg=(byte[])pluginType.GetMethod("CaptureFrame").Invoke(plugin,null);
+     double change=(double)pluginType.GetProperty("Change").GetValue(plugin,null);
+     string signature=(string)pluginType.GetProperty("Signature").GetValue(plugin,null);
+     if(browser && settings.Provider!="Off") {
+      if(change>0.20) { decision=Decision.Unknown(T("화면 변경 · 다시 확인 중","Scene changed · checking again")); nextAi=0; }
+      string key=DecisionCache.Key(settings,currentTitle,signature); Decision cached=settings.CacheEnabled?cache.Get(key):null;
+      if(cached!=null) { decision=cached; decisionAt=now; }
+      else if(!busy && now>=nextAi && now-lastRequest>=5) {
+       string image=Convert.ToBase64String(jpeg); string[] images=previousImage==null?new[]{image}:new[]{previousImage,image};
+       previousImage=image; nextAi=now+settings.AiInterval; lastRequest=now;
+       var ignored=Analyze(settings.Clone(),currentTitle,images,key,generation,cache.Generation);
+      }
+      if(now-decisionAt>Math.Max(45,settings.AiInterval*2)) decision=Decision.Unknown(T("AI 응답 대기 / 설정에서 연결 테스트","Waiting for AI / test connection in Settings"));
+     } else {
+      bool studying=StudyPolicy.IsStudying(process,currentTitle,settings.Keywords,Native.Idle(),change>0.006);
+      decision=new Decision { label=studying?"study":"leisure",confidence=1,reason=T("앱·단어·입력 활동 규칙 (추정)","App, word and activity rules (estimate)") }; decisionAt=now;
+     }
     }
-    internal sealed class Reminder : Form {
-        readonly Timer closeTimer=new Timer();
-        protected override bool ShowWithoutActivation { get { return true; } }
-        public Reminder(Action resume,Action rest) {
-            Text="Miareve · 공부 알림"; ClientSize=new Size(420,190); BackColor=Color.FromArgb(28,33,47); ForeColor=Color.White;
-            Font=new Font("맑은 고딕",10); FormBorderStyle=FormBorderStyle.FixedToolWindow; TopMost=true; ShowInTaskbar=false; StartPosition=FormStartPosition.Manual;
-            Rectangle area=Screen.PrimaryScreen.WorkingArea; Location=new Point(area.Right-Width-20,area.Bottom-Height-20);
-            Controls.Add(new Label { Text="공부 안할거냐?", Font=new Font("맑은 고딕",23,FontStyle.Bold), AutoSize=true, Location=new Point(22,20), ForeColor=Color.FromArgb(195,177,255) });
-            Controls.Add(new Label { Text="작은 키프레임 하나부터 다시 시작해 보자.", AutoSize=true, Location=new Point(24,75) });
-            var back=new Button { Text="지금 할게", Location=new Point(24,120), Size=new Size(165,40) };
-            var pause=new Button { Text="10분만 쉴게", Location=new Point(205,120), Size=new Size(185,40) };
-            back.Click+=delegate { resume(); Close(); }; pause.Click+=delegate { rest(); Close(); }; Controls.AddRange(new Control[]{back,pause});
-            closeTimer.Interval=20000; closeTimer.Tick+=delegate { Close(); }; closeTimer.Start();
-        }
-        protected override void Dispose(bool disposing) { if (disposing) closeTimer.Dispose(); base.Dispose(disposing); }
-    }
+    if(decision.label=="unknown") clock.ResetAway(); else clock.Tick(decision.label=="study",elapsed);
+    status.Text=decision.label=="study"?T("좋아요, 공부 흐름을 이어가요.","Keep your creative flow."):decision.label=="leisure"?T("공부에서 벗어난 것으로 보여요.","Looks like a study break."):T("판단 보류 · 확인 중","Uncertain · checking");
+    reason.Text=decision.reason=="cache"?T("저장된 AI 판단 재사용 (추정)","Cached AI decision (estimate)"):String.IsNullOrEmpty(decision.reason)?T("AI가 준비되지 않았다면 설정에서 연결하세요.","Connect your AI in Settings if it is not ready."):decision.reason;
+    UpdateState();
+    if(clock.AwaySeconds>=settings.AlertSeconds) { clock.ResetAway(); ShowReminder(); }
+   } catch { Stop(); status.Text=T("화면 분석 중지","Screen analysis stopped"); reason.Text=T("활성 창을 읽지 못했습니다. 잠금을 해제하고 다시 시작하세요.","Could not read the active window. Unlock and restart monitoring."); }
+  }
+  async Task Analyze(Settings snapshot,string title,string[] images,string key,int epoch,int cacheGeneration) {
+   busy=true; var job=new CancellationTokenSource(TimeSpan.FromSeconds(120)); aiJob=job;
+   try {
+    var result=await AiClient.Classify(snapshot,title,images,job.Token);
+    if(disposing || generation!=epoch || !running || !consent.Checked || editing) return;
+    decision=result; decisionAt=watch.Elapsed.TotalSeconds;
+    if(snapshot.CacheEnabled) try { cache.Put(key,result,snapshot.CacheMinutes,cacheGeneration); } catch { reason.Text=T("캐시 저장 실패 · AI 판단은 계속 사용합니다.","Cache save failed · AI result still available."); }
+   } catch(OperationCanceledException) { }
+   catch(Exception ex) { if(!disposing && generation==epoch) { decision=Decision.Unknown(T("AI 연결 확인 필요: ","AI connection needs attention: ")+ex.Message); decisionAt=watch.Elapsed.TotalSeconds; } }
+   finally { if(aiJob==job) aiJob=null; job.Dispose(); busy=false; }
+  }
+  protected override void Dispose(bool disposingNow) {
+   if(disposingNow && !disposing) { disposing=true; timer.Stop(); timer.Dispose(); SystemEvents.SessionSwitch-=SessionSwitch; SystemEvents.PowerModeChanged-=PowerChanged; Suspend(); tray.Visible=false; tray.Dispose(); }
+   base.Dispose(disposingNow);
+  }
+ }
+ public sealed class Reminder : Form {
+  static readonly string[] Korean={"공부 안할거냐?","공부좀 하세요","공부 안함?","디자인하러 가라","꿈을 키워라","키프레임 하나만 더!"};
+  static readonly string[] English={"Time to study!","Let's get some studying done.","Ready to get back to work?","Go create something.","Build your dream.","Just one more keyframe!"};
+  readonly Rectangle area;
+  protected override bool ShowWithoutActivation { get { return true; } }
+  public Reminder(string language,int index,Action resume,Action rest) {
+   bool en=language=="en"; area=Screen.FromHandle(Native.GetForegroundWindow()).WorkingArea;
+   Text="Miareve · "+(en?"Study reminder":"공부 알림"); ClientSize=new Size(720,340); BackColor=Theme.Background; ForeColor=Color.White;
+   Font=new Font("맑은 고딕",11); AutoScaleMode=AutoScaleMode.Dpi; FormBorderStyle=FormBorderStyle.FixedDialog; MaximizeBox=false; MinimizeBox=false; TopMost=true; ShowInTaskbar=true; StartPosition=FormStartPosition.Manual;
+   var root=Theme.Table(); Controls.Add(root);
+   var caption=Theme.Label("M I A R E V E   /   F O C U S",11); caption.ForeColor=Theme.Accent; caption.TextAlign=ContentAlignment.MiddleCenter; Theme.Row(root,caption,38);
+   var title=Theme.Label((en?English:Korean)[index%Korean.Length],en?27:36); title.TextAlign=ContentAlignment.MiddleCenter; title.ForeColor=Theme.Accent; Theme.Row(root,title,109);
+   var sub=Theme.Label(en?"Make one small step toward your next scene.":"작은 키프레임 하나부터 다시 시작해 보자.",12); sub.TextAlign=ContentAlignment.MiddleCenter; Theme.Row(root,sub,47);
+   var buttons=new TableLayoutPanel { ColumnCount=2,Dock=DockStyle.Fill }; buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50)); buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50));
+   var back=Theme.Button(en?"I'm getting back to it":"지금 할게",delegate { resume(); Close(); }); back.Name="Acknowledge"; back.Dock=DockStyle.Fill;
+   var pause=Theme.Button(en?"Rest 10 minutes":"10분만 쉴게",delegate { rest(); Close(); }); pause.Name="Rest"; pause.Dock=DockStyle.Fill;
+   buttons.Controls.Add(back,0,0); buttons.Controls.Add(pause,1,0); Theme.Row(root,buttons,57);
+   var foot=Theme.Label(en?"This reminder stays until you dismiss it.":"확인할 때까지 화면에 표시됩니다.",9); foot.TextAlign=ContentAlignment.MiddleCenter; Theme.Row(root,foot,31);
+   FormClosed+=delegate { resume(); };
+  }
+  protected override void OnShown(EventArgs e) { base.OnShown(e); Size=new Size(Math.Min(Width,area.Width-24),Math.Min(Height,area.Height-24)); Location=new Point(area.Left+(area.Width-Width)/2,area.Top+(area.Height-Height)/2); }
+ }
+ public static class Preview {
+  public static void Save(Form f,string path) { f.Show(); Application.DoEvents(); using(var b=new Bitmap(f.Width,f.Height)) { f.DrawToBitmap(b,new Rectangle(0,0,f.Width,f.Height)); b.Save(path); } }
+  public static void Run(string root) {
+   Directory.CreateDirectory(root); var storage=new Storage(Path.Combine(root,"preview-data"));
+   using(var f=new MainForm(storage)) { Save(f,Path.Combine(root,"main.png")); f.Close(); }
+   using(var f=new SettingsForm(new Settings(),new DecisionCache(storage.Root),delegate{},storage.Root)) { Save(f,Path.Combine(root,"settings.png")); f.Close(); }
+   using(var f=new Reminder("ko",0,delegate{},delegate{})) { Save(f,Path.Combine(root,"reminder.png")); f.Close(); }
+  }
+ }
 }
